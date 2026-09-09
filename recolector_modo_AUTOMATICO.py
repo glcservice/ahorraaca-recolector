@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V9.9 - logos Brandfetch mejorados
+AhorraAcá - Recolector MODO V10 - logos Brandfetch corregidos
 
 ETAPA 2
 -------
@@ -1012,9 +1012,11 @@ def construir_url_logo_brandfetch(dominio: str) -> str | None:
     if not dominio or "." not in dominio or not BRANDFETCH_CLIENT_ID:
         return None
 
+    # Formato oficial de Brandfetch Logo API:
+    # https://cdn.brandfetch.io/:domain/h/128/w/128/icon.png?c=CLIENT_ID
     return (
         "https://cdn.brandfetch.io/"
-        f"{quote(dominio, safe='.')}/w/128/h/128/type/icon.png"
+        f"{quote(dominio, safe='.')}/h/128/w/128/icon.png"
         f"?c={quote(BRANDFETCH_CLIENT_ID, safe='')}"
     )
 
@@ -1084,7 +1086,8 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
     if dominio_directo:
         logo = construir_url_logo_brandfetch(dominio_directo)
         print(
-            f"   [LOGO] {comercio} -> dominio verificado {dominio_directo}"
+            f"   [LOGO] {comercio} -> dominio verificado {dominio_directo} "
+            f"| CDN: https://cdn.brandfetch.io/{dominio_directo}/h/128/w/128/icon.png"
         )
         return logo
 
@@ -2396,7 +2399,7 @@ def analizar_promo(
         ).upper()
 
     observaciones = (
-        "V9.9 API MODO | medios separados | fechas Argentina UTC-3 | logos Brandfetch mejorados | resistente"
+        "V10 API MODO | medios separados | fechas Argentina UTC-3 | logos Brandfetch corregidos | resistente"
     )
 
     if estado_api:
@@ -3184,7 +3187,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V9.9 + LOGOS BRANDFETCH MEJORADOS"
+        "AhorraAcá - recolector MODO V10 + LOGOS BRANDFETCH CORREGIDOS"
     )
     print(
         "Descubriendo promociones actuales..."
