@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V12 - logos persistentes por comercio
+AhorraAcá - Recolector MODO V13 - URL canónica Brandfetch
 
 ETAPA 2
 -------
@@ -972,6 +972,57 @@ def clave_logo_comercio(comercio: str) -> str:
     return normalizar_nombre_marca(comercio)
 
 
+
+def logo_url_brandfetch_es_legacy(url: str) -> bool:
+    """
+    Detecta URLs generadas por las versiones V9-V12:
+    https://cdn.brandfetch.io/<dominio>/h/128/w/128/icon.png?c=...
+    """
+    valor = str(url or "").strip().lower()
+    return (
+        valor.startswith("https://cdn.brandfetch.io/") and
+        "/domain/" not in valor and
+        "/h/128/w/128/icon.png" in valor
+    )
+
+
+def migrar_logo_cache_a_url_canonica(fila: dict) -> dict:
+    """
+    Si una fila persistente tiene la URL vieja pero conserva dominio,
+    regenera la URL canónica y actualiza Supabase.
+    """
+    if not isinstance(fila, dict):
+        return fila
+
+    comercio = str(fila.get("comercio", "") or "").strip()
+    dominio = str(fila.get("dominio", "") or "").strip()
+    logo = str(fila.get("logo_url", "") or "").strip()
+
+    if (
+        comercio and
+        dominio and
+        logo_url_brandfetch_es_legacy(logo) and
+        BRANDFETCH_CLIENT_ID
+    ):
+        nuevo_logo = construir_url_logo_brandfetch(dominio)
+
+        if nuevo_logo and nuevo_logo != logo:
+            print(
+                f"   [LOGO] Migrando URL legacy -> canónica: {comercio}"
+            )
+            guardar_logo_cache(
+                comercio,
+                nuevo_logo,
+                dominio,
+                "brandfetch",
+            )
+            fila = dict(fila)
+            fila["logo_url"] = nuevo_logo
+            fila["fuente"] = "brandfetch"
+
+    return fila
+
+
 def cargar_cache_logos():
     """
     Carga public.comercios_logos en memoria una vez por ejecución.
@@ -1003,9 +1054,11 @@ def cargar_cache_logos():
         if not isinstance(filas, list):
             filas = []
 
+        # Primera pasada: cargar lo existente en memoria.
         for fila in filas:
             if not isinstance(fila, dict):
                 continue
+
             clave = str(
                 fila.get("comercio_normalizado", "") or ""
             ).strip()
@@ -1015,6 +1068,17 @@ def cargar_cache_logos():
 
             if clave and logo_url:
                 LOGOS_CACHE[clave] = fila
+
+        # Segunda pasada: migrar automáticamente URLs antiguas.
+        for fila in list(LOGOS_CACHE.values()):
+            fila_migrada = migrar_logo_cache_a_url_canonica(fila)
+
+            clave = str(
+                fila_migrada.get("comercio_normalizado", "") or ""
+            ).strip()
+
+            if clave:
+                LOGOS_CACHE[clave] = fila_migrada
 
         print(
             f"[LOGO] Cache persistente cargada: "
@@ -1164,11 +1228,11 @@ def construir_url_logo_brandfetch(dominio: str) -> str | None:
     if not dominio or "." not in dominio or not BRANDFETCH_CLIENT_ID:
         return None
 
-    # Formato oficial de Brandfetch Logo API:
-    # https://cdn.brandfetch.io/:domain/h/128/w/128/icon.png?c=CLIENT_ID
+    # Formato canónico actual de Brandfetch Logo API:
+    # https://cdn.brandfetch.io/domain/example.com?c=CLIENT_ID
     return (
-        "https://cdn.brandfetch.io/"
-        f"{quote(dominio, safe='.')}/h/128/w/128/icon.png"
+        "https://cdn.brandfetch.io/domain/"
+        f"{quote(dominio, safe='.')}"
         f"?c={quote(BRANDFETCH_CLIENT_ID, safe='')}"
     )
 
@@ -1248,7 +1312,7 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
         logo = construir_url_logo_brandfetch(dominio_directo)
         print(
             f"   [LOGO] {comercio} -> dominio verificado {dominio_directo} "
-            f"| CDN: https://cdn.brandfetch.io/{dominio_directo}/h/128/w/128/icon.png"
+            f"| CDN: https://cdn.brandfetch.io/domain/{dominio_directo}"
         )
         if logo:
             guardar_logo_cache(
@@ -3557,7 +3621,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V12 + LOGOS PERSISTENTES"
+        "AhorraAcá - recolector MODO V13 + URL CANÓNICA BRANDFETCH"
     )
     print(
         "Descubriendo promociones actuales..."
