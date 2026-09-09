@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V10 - logos Brandfetch corregidos
+AhorraAcá - Recolector MODO V11 - logos sincronizados por comercio
 
 ETAPA 2
 -------
@@ -1166,7 +1166,7 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
 def sincronizar_logos_publicados():
     """
     Copia logo_url_detectada desde promociones_detectadas hacia logo_url
-    en promociones, emparejando por fuente_url.
+    en promociones, emparejando por comercio.
 
     Se ejecuta DESPUÉS de publicar, por lo que no exige modificar la RPC SQL
     existente. Los fallos de logos nunca detienen el ciclo de promociones.
@@ -1183,8 +1183,9 @@ def sincronizar_logos_publicados():
 
     endpoint_detectadas = SUPABASE_URL + "/rest/v1/promociones_detectadas"
     params = {
-        "select": "fuente_url,logo_url_detectada",
+        "select": "comercio_detectado,logo_url_detectada",
         "logo_url_detectada": "not.is.null",
+        "comercio_detectado": "not.is.null",
         "limit": "5000",
     }
 
@@ -1203,13 +1204,24 @@ def sincronizar_logos_publicados():
     actualizadas = 0
     errores = 0
 
-    for fila in filas:
-        fuente_url = str(fila.get("fuente_url", "") or "").strip()
-        logo_url = str(fila.get("logo_url_detectada", "") or "").strip()
+    # Evitamos repetir PATCH si varias promos detectadas corresponden
+    # al mismo comercio y resolvieron el mismo logo.
+    logos_por_comercio = {}
 
-        if not fuente_url or not logo_url:
+    for fila in filas:
+        comercio = str(
+            fila.get("comercio_detectado", "") or ""
+        ).strip()
+        logo_url = str(
+            fila.get("logo_url_detectada", "") or ""
+        ).strip()
+
+        if not comercio or not logo_url:
             continue
 
+        logos_por_comercio[comercio] = logo_url
+
+    for comercio, logo_url in sorted(logos_por_comercio.items()):
         try:
             endpoint_publicas = SUPABASE_URL + "/rest/v1/promociones"
             headers_patch = {
@@ -1218,11 +1230,14 @@ def sincronizar_logos_publicados():
                 "Prefer": "return=minimal",
             }
 
+            # La tabla pública promociones no tiene fuente_url.
+            # Sincronizamos por el campo comercio, que sí existe en ambas
+            # tablas y es el identificador que consume Android.
             r = pedir_con_reintentos(
                 "PATCH",
                 endpoint_publicas,
                 headers=headers_patch,
-                params={"fuente_url": f"eq.{fuente_url}"},
+                params={"comercio": f"eq.{comercio}"},
                 data=json.dumps(
                     {"logo_url": logo_url},
                     ensure_ascii=False,
@@ -1235,11 +1250,14 @@ def sincronizar_logos_publicados():
                 )
 
             actualizadas += 1
+            print(
+                f"   [LOGO] Sincronizado -> {comercio}"
+            )
 
         except Exception as exc:
             errores += 1
             print(
-                f"   [LOGO] Error sincronizando {fuente_url}: {exc}"
+                f"   [LOGO] Error sincronizando {comercio!r}: {exc}"
             )
 
     print()
@@ -3187,7 +3205,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V10 + LOGOS BRANDFETCH CORREGIDOS"
+        "AhorraAcá - recolector MODO V11 + LOGOS POR COMERCIO"
     )
     print(
         "Descubriendo promociones actuales..."
