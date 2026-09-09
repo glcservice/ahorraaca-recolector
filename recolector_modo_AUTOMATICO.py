@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V9.7 - últimos rubros confirmados
+AhorraAcá - Recolector MODO V9.8 - logos automáticos Brandfetch
 
 ETAPA 2
 -------
@@ -20,6 +20,7 @@ VARIABLES DE ENTORNO
 --------------------
 SUPABASE_URL=https://TU-PROYECTO.supabase.co
 SUPABASE_SECRET_KEY=TU_SECRET_KEY
+BRANDFETCH_CLIENT_ID=TU_CLIENT_ID
 
 IMPORTANTE:
 La SECRET KEY se usa solamente en este proceso externo.
@@ -35,7 +36,7 @@ import hashlib
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,6 +44,7 @@ from bs4 import BeautifulSoup
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+BRANDFETCH_CLIENT_ID = os.environ.get("BRANDFETCH_CLIENT_ID", "").strip()
 
 FUENTE = "MODO"
 
@@ -922,6 +924,233 @@ def contiene_patron_banco(texto_normal: str, banco: str) -> bool:
             flags=re.I,
         )
         for patron in patrones
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# BRANDFETCH - LOGOS AUTOMÁTICOS
+# ---------------------------------------------------------------------------
+
+BRANDFETCH_SEARCH_URL = "https://api.brandfetch.io/v2/search"
+
+
+def normalizar_nombre_marca(texto: str) -> str:
+    """Normaliza nombres para comparar el comercio de MODO con Brandfetch."""
+    texto = normalizar(texto)
+    texto = re.sub(r"\b(s\.?a\.?|s\.?r\.?l\.?|sa|srl|argentina|arg)\b", " ", texto)
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def puntuar_marca_brandfetch(comercio: str, candidato: dict) -> float:
+    """
+    Puntaje conservador: preferimos no poner logo antes que asignar
+    el logo de otra empresa con un nombre parecido.
+    """
+    buscado = normalizar_nombre_marca(comercio)
+    nombre = normalizar_nombre_marca(str(candidato.get("name", "") or ""))
+
+    if not buscado or not nombre:
+        return 0.0
+
+    if buscado == nombre:
+        return 100.0
+
+    tokens_buscado = {t for t in buscado.split() if len(t) >= 2}
+    tokens_nombre = {t for t in nombre.split() if len(t) >= 2}
+
+    if not tokens_buscado or not tokens_nombre:
+        return 0.0
+
+    comunes = tokens_buscado & tokens_nombre
+    cobertura_buscado = len(comunes) / len(tokens_buscado)
+    cobertura_nombre = len(comunes) / len(tokens_nombre)
+
+    # Ej.: "Havanna" vs "Havanna Argentina".
+    if cobertura_buscado == 1.0 and cobertura_nombre >= 0.5:
+        return 90.0
+
+    if cobertura_nombre == 1.0 and cobertura_buscado >= 0.75:
+        return 85.0
+
+    # Coincidencia fuerte, pero no perfecta.
+    if cobertura_buscado >= 0.75 and cobertura_nombre >= 0.60:
+        return 70.0
+
+    return 0.0
+
+
+def obtener_logo_brandfetch(comercio: str) -> str | None:
+    """
+    Busca por nombre con Brand Search API y devuelve el icono del mejor
+    candidato sólo cuando la coincidencia es suficientemente segura.
+
+    Si no hay Client ID, no rompe el recolector: simplemente deja logo vacío.
+    """
+    if not BRANDFETCH_CLIENT_ID:
+        return None
+
+    comercio = str(comercio or "").strip()
+    if not comercio:
+        return None
+
+    if normalizar(comercio) in {
+        "comercios que acepten modo",
+        "promociones modo",
+        "modo",
+    }:
+        return None
+
+    url = f"{BRANDFETCH_SEARCH_URL}/{quote(comercio, safe='')}"
+
+    try:
+        respuesta = pedir_con_reintentos(
+            "GET",
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": HEADERS_WEB["User-Agent"],
+            },
+            params={"c": BRANDFETCH_CLIENT_ID},
+        )
+
+        if respuesta.status_code != 200:
+            print(
+                f"   [LOGO] Brandfetch HTTP {respuesta.status_code} "
+                f"para {comercio!r}"
+            )
+            return None
+
+        candidatos = respuesta.json()
+        if not isinstance(candidatos, list) or not candidatos:
+            return None
+
+        evaluados = []
+        for candidato in candidatos[:10]:
+            if not isinstance(candidato, dict):
+                continue
+
+            icono = str(candidato.get("icon", "") or "").strip()
+            if not icono.startswith("http"):
+                continue
+
+            puntaje = puntuar_marca_brandfetch(comercio, candidato)
+            if candidato.get("claimed") is True:
+                puntaje += 2.0
+
+            evaluados.append((puntaje, candidato))
+
+        if not evaluados:
+            return None
+
+        evaluados.sort(key=lambda x: x[0], reverse=True)
+        puntaje, mejor = evaluados[0]
+
+        if puntaje < 70.0:
+            print(
+                f"   [LOGO] Sin coincidencia segura para {comercio!r} "
+                f"(mejor={mejor.get('name')!r}, score={puntaje:.0f})"
+            )
+            return None
+
+        icono = str(mejor.get("icon", "") or "").strip()
+        print(
+            f"   [LOGO] {comercio} -> {mejor.get('name')} "
+            f"({mejor.get('domain') or '-'})"
+        )
+        return icono
+
+    except Exception as exc:
+        print(
+            f"   [LOGO] No pude resolver {comercio!r}: {exc}"
+        )
+        return None
+
+
+def sincronizar_logos_publicados():
+    """
+    Copia logo_url_detectada desde promociones_detectadas hacia logo_url
+    en promociones, emparejando por fuente_url.
+
+    Se ejecuta DESPUÉS de publicar, por lo que no exige modificar la RPC SQL
+    existente. Los fallos de logos nunca detienen el ciclo de promociones.
+    """
+    if not BRANDFETCH_CLIENT_ID:
+        print()
+        print("[LOGO] BRANDFETCH_CLIENT_ID no configurado; se omiten logos.")
+        return
+
+    headers_get = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Accept": "application/json",
+    }
+
+    endpoint_detectadas = SUPABASE_URL + "/rest/v1/promociones_detectadas"
+    params = {
+        "select": "fuente_url,logo_url_detectada",
+        "logo_url_detectada": "not.is.null",
+        "limit": "5000",
+    }
+
+    respuesta = pedir_con_reintentos(
+        "GET",
+        endpoint_detectadas,
+        headers=headers_get,
+        params=params,
+    )
+    respuesta.raise_for_status()
+
+    filas = respuesta.json()
+    if not isinstance(filas, list):
+        filas = []
+
+    actualizadas = 0
+    errores = 0
+
+    for fila in filas:
+        fuente_url = str(fila.get("fuente_url", "") or "").strip()
+        logo_url = str(fila.get("logo_url_detectada", "") or "").strip()
+
+        if not fuente_url or not logo_url:
+            continue
+
+        try:
+            endpoint_publicas = SUPABASE_URL + "/rest/v1/promociones"
+            headers_patch = {
+                "apikey": SUPABASE_SECRET_KEY,
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }
+
+            r = pedir_con_reintentos(
+                "PATCH",
+                endpoint_publicas,
+                headers=headers_patch,
+                params={"fuente_url": f"eq.{fuente_url}"},
+                data=json.dumps(
+                    {"logo_url": logo_url},
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+            if r.status_code not in (200, 204):
+                raise RuntimeError(
+                    f"Supabase {r.status_code}: {r.text[:500]}"
+                )
+
+            actualizadas += 1
+
+        except Exception as exc:
+            errores += 1
+            print(
+                f"   [LOGO] Error sincronizando {fuente_url}: {exc}"
+            )
+
+    print()
+    print(
+        f"[LOGO] Logos sincronizados a promociones: {actualizadas} | "
+        f"errores: {errores}"
     )
 
 
@@ -2045,6 +2274,12 @@ def analizar_promo(
         categoria = "general"
         comercio = "Comercios que acepten MODO"
 
+    # Logo automático por nombre de comercio. Es no bloqueante:
+    # si Brandfetch no encuentra una coincidencia segura, queda en null.
+    logo_url_detectada = obtener_logo_brandfetch(
+        comercio
+    )
+
     hash_base = {
         "texto": texto,
         "api": card_api or {},
@@ -2069,7 +2304,7 @@ def analizar_promo(
         ).upper()
 
     observaciones = (
-        "V9.7 API MODO | medios separados | fechas Argentina UTC-3 | últimos rubros confirmados | resistente"
+        "V9.8 API MODO | medios separados | fechas Argentina UTC-3 | logos Brandfetch | resistente"
     )
 
     if estado_api:
@@ -2091,6 +2326,7 @@ def analizar_promo(
         "titulo": titulo,
         "comercio_detectado": comercio,
         "categoria_detectada": categoria,
+        "logo_url_detectada": logo_url_detectada,
         "porcentaje_detectado": porcentaje,
         "monto_minimo_detectado": monto_minimo,
         "tope_reintegro_detectado": tope,
@@ -2856,7 +3092,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V9.7 ULTIMOS RUBROS CONFIRMADOS"
+        "AhorraAcá - recolector MODO V9.8 + LOGOS BRANDFETCH"
     )
     print(
         "Descubriendo promociones actuales..."
@@ -2919,7 +3155,8 @@ def main():
                 f"{promo['vigencia_hasta_detectada']} | "
                 f"Billetera: {', '.join(promo['billeteras_detectadas']) or '-'} | "
                 f"Bancos: {', '.join(promo['bancos_detectados']) or '-'} | "
-                f"Tarjetas: {', '.join(promo['tarjetas_detectadas']) or '-'}"
+                f"Tarjetas: {', '.join(promo['tarjetas_detectadas']) or '-'} | "
+                f"Logo: {'SI' if promo.get('logo_url_detectada') else 'NO'}"
             )
 
         except Exception as exc:
@@ -3091,6 +3328,13 @@ def ejecutar_ciclo_automatico():
 
     # 3) Publicar las promociones revisadas a la tabla consumida por Android.
     ejecutar_rpc_supabase("publicar_promociones_revisadas")
+
+    # 4) Copiar los logos detectados a la tabla pública consumida por Android.
+    try:
+        sincronizar_logos_publicados()
+    except Exception as exc:
+        # Un problema con logos no debe impedir que las promociones queden publicadas.
+        print(f"[WARN] No pude sincronizar logos publicados: {exc}")
 
     fin = datetime.now(TZ_ARGENTINA)
     print()
