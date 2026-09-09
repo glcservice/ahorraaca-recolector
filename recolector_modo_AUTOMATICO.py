@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V11 - logos sincronizados por comercio
+AhorraAcá - Recolector MODO V12 - logos persistentes por comercio
 
 ETAPA 2
 -------
@@ -934,6 +934,8 @@ def contiene_patron_banco(texto_normal: str, banco: str) -> bool:
 
 BRANDFETCH_SEARCH_URL = "https://api.brandfetch.io/v2/search"
 
+LOGOS_CACHE: dict[str, dict] = {}
+
 # Dominios oficiales verificados para marcas frecuentes.
 # Esto NO reemplaza la búsqueda automática: sirve como atajo seguro cuando
 # conocemos inequívocamente la marca y evita falsos negativos del buscador.
@@ -963,6 +965,156 @@ DOMINIOS_MARCAS_CONOCIDAS = {
     "axion": "axionenergy.com",
     "puma energy": "pumaenergy.com",
 }
+
+
+
+def clave_logo_comercio(comercio: str) -> str:
+    return normalizar_nombre_marca(comercio)
+
+
+def cargar_cache_logos():
+    """
+    Carga public.comercios_logos en memoria una vez por ejecución.
+    Si la tabla todavía no existe o no hay permiso, no rompe el recolector.
+    """
+    global LOGOS_CACHE
+    LOGOS_CACHE = {}
+
+    try:
+        endpoint = SUPABASE_URL + "/rest/v1/comercios_logos"
+        r = pedir_con_reintentos(
+            "GET",
+            endpoint,
+            headers={
+                "apikey": SUPABASE_SECRET_KEY,
+                "Accept": "application/json",
+            },
+            params={
+                "select": (
+                    "comercio,comercio_normalizado,dominio,"
+                    "logo_url,fuente,actualizado_at"
+                ),
+                "limit": "5000",
+            },
+        )
+        r.raise_for_status()
+
+        filas = r.json()
+        if not isinstance(filas, list):
+            filas = []
+
+        for fila in filas:
+            if not isinstance(fila, dict):
+                continue
+            clave = str(
+                fila.get("comercio_normalizado", "") or ""
+            ).strip()
+            logo_url = str(
+                fila.get("logo_url", "") or ""
+            ).strip()
+
+            if clave and logo_url:
+                LOGOS_CACHE[clave] = fila
+
+        print(
+            f"[LOGO] Cache persistente cargada: "
+            f"{len(LOGOS_CACHE)} comercios"
+        )
+
+    except Exception as exc:
+        print(
+            f"[WARN] No pude cargar comercios_logos: {exc}"
+        )
+
+
+def guardar_logo_cache(
+    comercio: str,
+    logo_url: str,
+    dominio: str | None = None,
+    fuente: str = "brandfetch",
+):
+    """
+    Guarda o actualiza un logo en public.comercios_logos.
+    Usa comercio_normalizado como clave única.
+    """
+    comercio = str(comercio or "").strip()
+    logo_url = str(logo_url or "").strip()
+    dominio = str(dominio or "").strip() or None
+    clave = clave_logo_comercio(comercio)
+
+    if not comercio or not clave or not logo_url:
+        return
+
+    payload = {
+        "comercio": comercio,
+        "comercio_normalizado": clave,
+        "dominio": dominio,
+        "logo_url": logo_url,
+        "fuente": fuente,
+        "actualizado_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        endpoint = SUPABASE_URL + "/rest/v1/comercios_logos"
+        r = pedir_con_reintentos(
+            "POST",
+            endpoint,
+            headers={
+                "apikey": SUPABASE_SECRET_KEY,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            params={
+                "on_conflict": "comercio_normalizado",
+            },
+            data=json.dumps(
+                payload,
+                ensure_ascii=False,
+            ).encode("utf-8"),
+        )
+
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(
+                f"Supabase {r.status_code}: {r.text[:500]}"
+            )
+
+        LOGOS_CACHE[clave] = payload
+
+    except Exception as exc:
+        print(
+            f"   [LOGO] No pude guardar cache para "
+            f"{comercio!r}: {exc}"
+        )
+
+
+def obtener_logo_desde_cache(comercio: str) -> str | None:
+    clave = clave_logo_comercio(comercio)
+    if not clave:
+        return None
+
+    fila = LOGOS_CACHE.get(clave)
+    if not isinstance(fila, dict):
+        return None
+
+    logo = str(
+        fila.get("logo_url", "") or ""
+    ).strip()
+
+    return logo or None
+
+
+def dominio_desde_cache(comercio: str) -> str | None:
+    clave = clave_logo_comercio(comercio)
+    fila = LOGOS_CACHE.get(clave)
+
+    if not isinstance(fila, dict):
+        return None
+
+    dominio = str(
+        fila.get("dominio", "") or ""
+    ).strip()
+
+    return dominio or None
 
 
 def normalizar_nombre_marca(texto: str) -> str:
@@ -1068,11 +1220,20 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
        vacío.
     4) Si no hay coincidencia segura, devuelve None.
     """
-    if not BRANDFETCH_CLIENT_ID:
-        return None
-
     comercio = str(comercio or "").strip()
     if not comercio:
+        return None
+
+    # Primero reutilizamos el logo persistente. Así una marca aprendida
+    # una vez no depende de que tenga una promo activa en la corrida actual.
+    logo_cache = obtener_logo_desde_cache(comercio)
+    if logo_cache:
+        print(
+            f"   [LOGO] {comercio} -> cache persistente"
+        )
+        return logo_cache
+
+    if not BRANDFETCH_CLIENT_ID:
         return None
 
     if normalizar(comercio) in {
@@ -1089,6 +1250,13 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
             f"   [LOGO] {comercio} -> dominio verificado {dominio_directo} "
             f"| CDN: https://cdn.brandfetch.io/{dominio_directo}/h/128/w/128/icon.png"
         )
+        if logo:
+            guardar_logo_cache(
+                comercio,
+                logo,
+                dominio_directo,
+                "brandfetch",
+            )
         return logo
 
     url = f"{BRANDFETCH_SEARCH_URL}/{quote(comercio, safe='')}"
@@ -1154,6 +1322,12 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
             f"   [LOGO] {comercio} -> {mejor.get('name')} "
             f"({dominio})"
         )
+        guardar_logo_cache(
+            comercio,
+            logo,
+            dominio,
+            "brandfetch",
+        )
         return logo
 
     except Exception as exc:
@@ -1163,83 +1337,256 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
         return None
 
 
-def sincronizar_logos_publicados():
-    """
-    Copia logo_url_detectada desde promociones_detectadas hacia logo_url
-    en promociones, emparejando por comercio.
 
-    Se ejecuta DESPUÉS de publicar, por lo que no exige modificar la RPC SQL
-    existente. Los fallos de logos nunca detienen el ciclo de promociones.
+def backfill_logos_comercios_historicos():
     """
-    if not BRANDFETCH_CLIENT_ID:
-        print()
-        print("[LOGO] BRANDFETCH_CLIENT_ID no configurado; se omiten logos.")
+    Aprende logos de comercios que ya existen en public.promociones,
+    aunque no hayan aparecido en la corrida actual de MODO.
+
+    Esto permite, por ejemplo, recuperar Havanna aunque hoy no tenga
+    una promoción activa entre las tarjetas devueltas por MODO.
+    """
+    try:
+        endpoint = SUPABASE_URL + "/rest/v1/promociones"
+        r = pedir_con_reintentos(
+            "GET",
+            endpoint,
+            headers={
+                "apikey": SUPABASE_SECRET_KEY,
+                "Accept": "application/json",
+            },
+            params={
+                "select": "comercio,logo_url",
+                "comercio": "not.is.null",
+                "limit": "5000",
+            },
+        )
+        r.raise_for_status()
+
+        filas = r.json()
+        if not isinstance(filas, list):
+            filas = []
+
+    except Exception as exc:
+        print(
+            f"[WARN] No pude leer comercios históricos: {exc}"
+        )
         return
 
-    headers_get = {
-        "apikey": SUPABASE_SECRET_KEY,
-        "Accept": "application/json",
-    }
-
-    endpoint_detectadas = SUPABASE_URL + "/rest/v1/promociones_detectadas"
-    params = {
-        "select": "comercio_detectado,logo_url_detectada",
-        "logo_url_detectada": "not.is.null",
-        "comercio_detectado": "not.is.null",
-        "limit": "5000",
-    }
-
-    respuesta = pedir_con_reintentos(
-        "GET",
-        endpoint_detectadas,
-        headers=headers_get,
-        params=params,
-    )
-    respuesta.raise_for_status()
-
-    filas = respuesta.json()
-    if not isinstance(filas, list):
-        filas = []
-
-    actualizadas = 0
-    errores = 0
-
-    # Evitamos repetir PATCH si varias promos detectadas corresponden
-    # al mismo comercio y resolvieron el mismo logo.
-    logos_por_comercio = {}
-
+    comercios = {}
     for fila in filas:
-        comercio = str(
-            fila.get("comercio_detectado", "") or ""
-        ).strip()
-        logo_url = str(
-            fila.get("logo_url_detectada", "") or ""
-        ).strip()
-
-        if not comercio or not logo_url:
+        if not isinstance(fila, dict):
             continue
 
-        logos_por_comercio[comercio] = logo_url
+        comercio = str(
+            fila.get("comercio", "") or ""
+        ).strip()
+        logo_publicado = str(
+            fila.get("logo_url", "") or ""
+        ).strip()
 
-    for comercio, logo_url in sorted(logos_por_comercio.items()):
-        try:
-            endpoint_publicas = SUPABASE_URL + "/rest/v1/promociones"
-            headers_patch = {
+        if not comercio:
+            continue
+
+        clave = clave_logo_comercio(comercio)
+        if not clave:
+            continue
+
+        comercios[clave] = comercio
+
+        # Si ya existe logo público pero todavía no está en la cache,
+        # lo preservamos para no perder un dato válido existente.
+        if logo_publicado and clave not in LOGOS_CACHE:
+            guardar_logo_cache(
+                comercio,
+                logo_publicado,
+                None,
+                "supabase_existente",
+            )
+
+    pendientes = [
+        comercio
+        for clave, comercio in sorted(comercios.items())
+        if clave not in LOGOS_CACHE
+    ]
+
+    if not pendientes:
+        print(
+            "[LOGO] Backfill histórico: no hay comercios pendientes."
+        )
+        return
+
+    print(
+        f"[LOGO] Backfill histórico: "
+        f"{len(pendientes)} comercios sin logo conocido."
+    )
+
+    aprendidos = 0
+    sin_logo = 0
+
+    for indice, comercio in enumerate(
+        pendientes,
+        start=1,
+    ):
+        print(
+            f"   [LOGO HIST {indice}/{len(pendientes)}] "
+            f"{comercio}"
+        )
+
+        logo = obtener_logo_brandfetch(comercio)
+
+        if logo:
+            aprendidos += 1
+        else:
+            sin_logo += 1
+
+        # Pequeña pausa para no castigar Brandfetch en un backfill grande.
+        time.sleep(0.08)
+
+    print(
+        f"[LOGO] Backfill histórico terminado: "
+        f"{aprendidos} aprendidos | {sin_logo} sin logo seguro"
+    )
+
+
+def sincronizar_logos_publicados():
+    """
+    Sincroniza la cache persistente public.comercios_logos hacia
+    public.promociones por nombre de comercio.
+
+    También incorpora a la cache cualquier logo detectado en la corrida
+    actual que todavía no estuviera guardado.
+    """
+    # 1) Incorporar logos detectados actuales a la cache.
+    try:
+        endpoint_detectadas = SUPABASE_URL + "/rest/v1/promociones_detectadas"
+        r = pedir_con_reintentos(
+            "GET",
+            endpoint_detectadas,
+            headers={
                 "apikey": SUPABASE_SECRET_KEY,
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-            }
+                "Accept": "application/json",
+            },
+            params={
+                "select": "comercio_detectado,logo_url_detectada",
+                "logo_url_detectada": "not.is.null",
+                "comercio_detectado": "not.is.null",
+                "limit": "5000",
+            },
+        )
+        r.raise_for_status()
 
-            # La tabla pública promociones no tiene fuente_url.
-            # Sincronizamos por el campo comercio, que sí existe en ambas
-            # tablas y es el identificador que consume Android.
+        filas = r.json()
+        if not isinstance(filas, list):
+            filas = []
+
+        for fila in filas:
+            if not isinstance(fila, dict):
+                continue
+
+            comercio = str(
+                fila.get("comercio_detectado", "") or ""
+            ).strip()
+            logo = str(
+                fila.get("logo_url_detectada", "") or ""
+            ).strip()
+
+            if comercio and logo:
+                clave = clave_logo_comercio(comercio)
+                if clave not in LOGOS_CACHE:
+                    guardar_logo_cache(
+                        comercio,
+                        logo,
+                        None,
+                        "brandfetch",
+                    )
+
+    except Exception as exc:
+        print(
+            f"[WARN] No pude incorporar logos detectados a cache: {exc}"
+        )
+
+    # 2) Leer comercios públicos actuales.
+    try:
+        endpoint_publicas = SUPABASE_URL + "/rest/v1/promociones"
+        r = pedir_con_reintentos(
+            "GET",
+            endpoint_publicas,
+            headers={
+                "apikey": SUPABASE_SECRET_KEY,
+                "Accept": "application/json",
+            },
+            params={
+                "select": "comercio,logo_url",
+                "comercio": "not.is.null",
+                "limit": "5000",
+            },
+        )
+        r.raise_for_status()
+
+        publicas = r.json()
+        if not isinstance(publicas, list):
+            publicas = []
+
+    except Exception as exc:
+        print(
+            f"[WARN] No pude leer promociones para sincronizar logos: {exc}"
+        )
+        return
+
+    actualizadas = 0
+    ya_correctas = 0
+    sin_logo = 0
+    errores = 0
+    procesados = set()
+
+    for fila in publicas:
+        if not isinstance(fila, dict):
+            continue
+
+        comercio = str(
+            fila.get("comercio", "") or ""
+        ).strip()
+
+        if not comercio:
+            continue
+
+        clave = clave_logo_comercio(comercio)
+        if not clave or clave in procesados:
+            continue
+        procesados.add(clave)
+
+        cache = LOGOS_CACHE.get(clave, {})
+        logo = str(
+            cache.get("logo_url", "") or ""
+        ).strip()
+
+        if not logo:
+            sin_logo += 1
+            continue
+
+        logo_actual = str(
+            fila.get("logo_url", "") or ""
+        ).strip()
+
+        if logo_actual == logo:
+            ya_correctas += 1
+            continue
+
+        try:
             r = pedir_con_reintentos(
                 "PATCH",
                 endpoint_publicas,
-                headers=headers_patch,
-                params={"comercio": f"eq.{comercio}"},
+                headers={
+                    "apikey": SUPABASE_SECRET_KEY,
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                params={
+                    "comercio": f"eq.{comercio}",
+                },
                 data=json.dumps(
-                    {"logo_url": logo_url},
+                    {"logo_url": logo},
                     ensure_ascii=False,
                 ).encode("utf-8"),
             )
@@ -1257,13 +1604,17 @@ def sincronizar_logos_publicados():
         except Exception as exc:
             errores += 1
             print(
-                f"   [LOGO] Error sincronizando {comercio!r}: {exc}"
+                f"   [LOGO] Error sincronizando "
+                f"{comercio!r}: {exc}"
             )
 
     print()
     print(
-        f"[LOGO] Logos sincronizados a promociones: {actualizadas} | "
-        f"errores: {errores}"
+        f"[LOGO] Sincronización final: "
+        f"{actualizadas} actualizados | "
+        f"{ya_correctas} ya correctos | "
+        f"{sin_logo} sin logo seguro | "
+        f"{errores} errores"
     )
 
 
@@ -3106,6 +3457,7 @@ def reprocesar_categoria_historica(
 
 def main():
     validar_configuracion()
+    cargar_cache_logos()
 
     # Autoprueba local antes de tocar la red o Supabase.
     prueba_chely = detectar_categoria_historica_directa(
@@ -3205,7 +3557,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V11 + LOGOS POR COMERCIO"
+        "AhorraAcá - recolector MODO V12 + LOGOS PERSISTENTES"
     )
     print(
         "Descubriendo promociones actuales..."
@@ -3442,7 +3794,14 @@ def ejecutar_ciclo_automatico():
     # 3) Publicar las promociones revisadas a la tabla consumida por Android.
     ejecutar_rpc_supabase("publicar_promociones_revisadas")
 
-    # 4) Copiar los logos detectados a la tabla pública consumida por Android.
+    # 4) Aprender logos históricos, incluso de comercios que hoy no
+    # aparecieron en la corrida actual (ej. Havanna).
+    try:
+        backfill_logos_comercios_historicos()
+    except Exception as exc:
+        print(f"[WARN] No pude completar backfill histórico de logos: {exc}")
+
+    # 5) Copiar la cache persistente a la tabla pública consumida por Android.
     try:
         sincronizar_logos_publicados()
     except Exception as exc:
