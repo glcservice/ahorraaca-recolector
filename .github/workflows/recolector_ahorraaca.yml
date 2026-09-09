@@ -1,0 +1,41 @@
+name: AhorraAca - Actualizar promociones
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions usa UTC.
+    # 10:00 UTC = 07:00 Argentina
+    # 18:00 UTC = 15:00 Argentina
+    - cron: "0 10,18 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ahorraaca-recolector
+  cancel-in-progress: false
+
+jobs:
+  actualizar-promociones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements_ahorraaca.txt
+
+      - name: Recolectar, validar y publicar
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python recolector_modo_AUTOMATICO.py
