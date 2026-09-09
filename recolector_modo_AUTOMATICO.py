@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V14 - logos validados + fallback
+AhorraAcá - Recolector MODO V15 - resistente a caídas de MODO
 
 ETAPA 2
 -------
@@ -407,7 +407,7 @@ def recorrer_sitemap(
     return encontrados
 
 
-def descubrir_urls_promos() -> list[str]:
+def descubrir_urls_promos() -> list[str] | None:
     """
     Consulta la misma API que utiliza el buscador web de MODO.
 
@@ -462,22 +462,84 @@ def descubrir_urls_promos() -> list[str]:
             "https://www.modo.com.ar/promos"
         )
 
-        respuesta = pedir_con_reintentos(
-            "GET",
-            MODO_API_URL,
-            params=params,
-            headers=headers,
-        )
+        respuesta = None
+        ultimo_error = None
 
-        respuesta.raise_for_status()
+        for intento_api in range(1, 6):
+            try:
+                respuesta = pedir_con_reintentos(
+                    "GET",
+                    MODO_API_URL,
+                    params=params,
+                    headers=headers,
+                )
+
+                if respuesta.status_code in {
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                }:
+                    print(
+                        f"   [MODO] Página {pagina}: intento "
+                        f"{intento_api}/5 -> HTTP "
+                        f"{respuesta.status_code}"
+                    )
+
+                    if intento_api < 5:
+                        time.sleep(
+                            min(
+                                30,
+                                3 * intento_api,
+                            )
+                        )
+                        continue
+
+                    print(
+                        "   [MODO] API temporalmente no disponible. "
+                        "Se conserva la base actual sin cambios."
+                    )
+                    return None
+
+                respuesta.raise_for_status()
+                ultimo_error = None
+                break
+
+            except requests.RequestException as exc:
+                ultimo_error = exc
+
+                print(
+                    f"   [MODO] Página {pagina}: intento "
+                    f"{intento_api}/5 -> "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                if intento_api < 5:
+                    time.sleep(
+                        min(
+                            30,
+                            3 * intento_api,
+                        )
+                    )
+                    continue
+
+        if ultimo_error is not None or respuesta is None:
+            print(
+                "   [MODO] No se pudo consultar la API después "
+                "de 5 intentos. Se conserva la base actual sin cambios."
+            )
+            return None
 
         try:
             payload = respuesta.json()
 
         except Exception as exc:
-            raise RuntimeError(
-                "La API de MODO respondió algo que no es JSON."
-            ) from exc
+            print(
+                "   [MODO] La API respondió contenido inválido. "
+                "Se conserva la base actual sin cambios."
+            )
+            return None
 
         data = (
             payload.get(
@@ -3826,13 +3888,24 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V14 + LOGOS VALIDADOS"
+        "AhorraAcá - recolector MODO V15 + RESISTENCIA MODO"
     )
     print(
         "Descubriendo promociones actuales..."
     )
 
     urls = descubrir_urls_promos()
+
+    if urls is None:
+        print()
+        print(
+            "[MODO] Fuente temporalmente no disponible. "
+            "No se valida ni publica nada en esta ejecución."
+        )
+        print(
+            "[MODO] Las promociones ya publicadas quedan intactas."
+        )
+        return
 
     print(
         f"Encontré {len(urls)} enlaces actuales/próximos."
