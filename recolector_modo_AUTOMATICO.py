@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V13 - URL canónica Brandfetch
+AhorraAcá - Recolector MODO V14 - logos validados + fallback
 
 ETAPA 2
 -------
@@ -40,6 +40,8 @@ from urllib.parse import urljoin, quote
 
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image, ImageStat
+from io import BytesIO
 
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
@@ -988,8 +990,10 @@ def logo_url_brandfetch_es_legacy(url: str) -> bool:
 
 def migrar_logo_cache_a_url_canonica(fila: dict) -> dict:
     """
-    Si una fila persistente tiene la URL vieja pero conserva dominio,
-    regenera la URL canónica y actualiza Supabase.
+    V14:
+    - migra URLs legacy
+    - valida las URLs ya guardadas
+    - si Brandfetch devuelve un cuadro blanco, intenta favicon del mismo dominio
     """
     if not isinstance(fila, dict):
         return fila
@@ -997,28 +1001,50 @@ def migrar_logo_cache_a_url_canonica(fila: dict) -> dict:
     comercio = str(fila.get("comercio", "") or "").strip()
     dominio = str(fila.get("dominio", "") or "").strip()
     logo = str(fila.get("logo_url", "") or "").strip()
+    fuente = str(fila.get("fuente", "") or "").strip()
 
-    if (
-        comercio and
-        dominio and
-        logo_url_brandfetch_es_legacy(logo) and
-        BRANDFETCH_CLIENT_ID
+    if not comercio:
+        return fila
+
+    necesita_revision = (
+        not logo or
+        logo_url_brandfetch_es_legacy(logo) or
+        fuente in {"brandfetch", "favicon_dominio", "supabase_existente"}
+    )
+
+    if not necesita_revision:
+        return fila
+
+    # Si la URL actual funciona de verdad, la conservamos.
+    if logo and validar_logo_url(
+        logo,
+        f"{comercio} / cache",
     ):
-        nuevo_logo = construir_url_logo_brandfetch(dominio)
+        return fila
 
-        if nuevo_logo and nuevo_logo != logo:
-            print(
-                f"   [LOGO] Migrando URL legacy -> canónica: {comercio}"
-            )
-            guardar_logo_cache(
-                comercio,
-                nuevo_logo,
-                dominio,
-                "brandfetch",
-            )
-            fila = dict(fila)
-            fila["logo_url"] = nuevo_logo
-            fila["fuente"] = "brandfetch"
+    if not dominio:
+        return fila
+
+    nuevo_logo, nueva_fuente = resolver_logo_por_dominio(
+        comercio,
+        dominio,
+    )
+
+    if nuevo_logo:
+        print(
+            f"   [LOGO] Reparando cache -> {comercio} ({nueva_fuente})"
+        )
+
+        guardar_logo_cache(
+            comercio,
+            nuevo_logo,
+            dominio,
+            nueva_fuente,
+        )
+
+        fila = dict(fila)
+        fila["logo_url"] = nuevo_logo
+        fila["fuente"] = nueva_fuente
 
     return fila
 
@@ -1216,6 +1242,173 @@ def dominio_conocido_para_comercio(comercio: str) -> str | None:
     return None
 
 
+
+def construir_url_favicon_google(dominio: str) -> str | None:
+    """
+    Fallback secundario para dominios ya verificados/resueltos.
+    Se usa sólo cuando Brandfetch devuelve una imagen inútil o vacía.
+    """
+    dominio = str(dominio or "").strip()
+    dominio = re.sub(r"^https?://", "", dominio, flags=re.I)
+    dominio = dominio.split("/")[0].strip().lower()
+
+    if not dominio or "." not in dominio:
+        return None
+
+    return (
+        "https://www.google.com/s2/favicons"
+        f"?domain={quote(dominio, safe='.')}&sz=128"
+    )
+
+
+def validar_logo_url(
+    url_logo: str,
+    descripcion: str = "",
+) -> bool:
+    """
+    Descarga una imagen y verifica que no sea un cuadro blanco/transparente.
+
+    Regla conservadora:
+    - respuesta HTTP válida
+    - imagen decodificable
+    - tamaño razonable
+    - contenido visible real
+
+    Una imagen blanca completamente opaca se considera inválida.
+    Una marca blanca sobre transparencia sí se acepta.
+    """
+    url_logo = str(url_logo or "").strip()
+
+    if not url_logo:
+        return False
+
+    try:
+        r = pedir_con_reintentos(
+            "GET",
+            url_logo,
+            headers={
+                "Accept": "image/*,*/*;q=0.5",
+                "User-Agent": HEADERS_WEB["User-Agent"],
+            },
+        )
+
+        if r.status_code != 200 or not r.content:
+            return False
+
+        imagen = Image.open(BytesIO(r.content)).convert("RGBA")
+
+        if imagen.width < 8 or imagen.height < 8:
+            return False
+
+        imagen.thumbnail((96, 96))
+
+        pixeles = list(imagen.getdata())
+        total = len(pixeles)
+
+        if total == 0:
+            return False
+
+        visibles = [
+            (r_, g_, b_, a_)
+            for (r_, g_, b_, a_) in pixeles
+            if a_ >= 20
+        ]
+
+        if len(visibles) / total < 0.01:
+            return False
+
+        # Si hay transparencia real, un logo blanco sigue siendo válido.
+        tiene_transparencia = any(a_ < 245 for _, _, _, a_ in pixeles)
+
+        if tiene_transparencia:
+            return True
+
+        # Imagen completamente opaca: medir cuánto se aleja del blanco.
+        no_blancos = 0
+
+        for r_, g_, b_, _ in visibles:
+            distancia_blanco = (
+                abs(255 - r_) +
+                abs(255 - g_) +
+                abs(255 - b_)
+            )
+
+            if distancia_blanco >= 30:
+                no_blancos += 1
+
+        proporcion_no_blanca = no_blancos / len(visibles)
+
+        if proporcion_no_blanca >= 0.015:
+            return True
+
+        # Segunda defensa: una imagen con variación apreciable también es útil.
+        rgb = imagen.convert("RGB")
+        stat = ImageStat.Stat(rgb)
+        variacion = sum(stat.stddev) / 3.0
+
+        return variacion >= 4.0
+
+    except Exception as exc:
+        if descripcion:
+            print(
+                f"   [LOGO] No pude validar {descripcion!r}: {exc}"
+            )
+        return False
+
+
+def resolver_logo_por_dominio(
+    comercio: str,
+    dominio: str,
+) -> tuple[str | None, str]:
+    """
+    1) Brandfetch.
+    2) Si la imagen es blanca/vacía/inválida, Google favicon del MISMO dominio.
+
+    Devuelve (url, fuente).
+    """
+    dominio = str(dominio or "").strip()
+
+    if not dominio:
+        return None, ""
+
+    logo_brandfetch = construir_url_logo_brandfetch(dominio)
+
+    if (
+        logo_brandfetch and
+        validar_logo_url(
+            logo_brandfetch,
+            f"{comercio} / Brandfetch",
+        )
+    ):
+        return logo_brandfetch, "brandfetch"
+
+    if logo_brandfetch:
+        print(
+            f"   [LOGO] Brandfetch inválido/blanco para {comercio!r}; "
+            f"probando favicon del dominio {dominio}"
+        )
+
+    logo_favicon = construir_url_favicon_google(dominio)
+
+    if (
+        logo_favicon and
+        validar_logo_url(
+            logo_favicon,
+            f"{comercio} / favicon",
+        )
+    ):
+        print(
+            f"   [LOGO] Fallback válido para {comercio}: {dominio}"
+        )
+        return logo_favicon, "favicon_dominio"
+
+    print(
+        f"   [LOGO] Sin imagen útil para {comercio!r} ({dominio})"
+    )
+
+    return None, ""
+
+
 def construir_url_logo_brandfetch(dominio: str) -> str | None:
     """
     Genera una URL estable del CDN de Brandfetch a partir del dominio.
@@ -1309,18 +1502,24 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
 
     dominio_directo = dominio_conocido_para_comercio(comercio)
     if dominio_directo:
-        logo = construir_url_logo_brandfetch(dominio_directo)
+        logo, fuente_logo = resolver_logo_por_dominio(
+            comercio,
+            dominio_directo,
+        )
+
         print(
             f"   [LOGO] {comercio} -> dominio verificado {dominio_directo} "
-            f"| CDN: https://cdn.brandfetch.io/domain/{dominio_directo}"
+            f"| fuente={fuente_logo or '-'}"
         )
+
         if logo:
             guardar_logo_cache(
                 comercio,
                 logo,
                 dominio_directo,
-                "brandfetch",
+                fuente_logo or "brandfetch",
             )
+
         return logo
 
     url = f"{BRANDFETCH_SEARCH_URL}/{quote(comercio, safe='')}"
@@ -1377,21 +1576,27 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
             return None
 
         dominio = str(mejor.get("domain", "") or "").strip()
-        logo = construir_url_logo_brandfetch(dominio)
+
+        logo, fuente_logo = resolver_logo_por_dominio(
+            comercio,
+            dominio,
+        )
 
         if not logo:
             return None
 
         print(
             f"   [LOGO] {comercio} -> {mejor.get('name')} "
-            f"({dominio})"
+            f"({dominio}) | fuente={fuente_logo}"
         )
+
         guardar_logo_cache(
             comercio,
             logo,
             dominio,
-            "brandfetch",
+            fuente_logo or "brandfetch",
         )
+
         return logo
 
     except Exception as exc:
@@ -3621,7 +3826,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V13 + URL CANÓNICA BRANDFETCH"
+        "AhorraAcá - recolector MODO V14 + LOGOS VALIDADOS"
     )
     print(
         "Descubriendo promociones actuales..."
