@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-AhorraAcá - Recolector MODO V9.8 - logos automáticos Brandfetch
+AhorraAcá - Recolector MODO V9.9 - logos Brandfetch mejorados
 
 ETAPA 2
 -------
@@ -929,10 +929,40 @@ def contiene_patron_banco(texto_normal: str, banco: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# BRANDFETCH - LOGOS AUTOMÁTICOS
+# BRANDFETCH - LOGOS AUTOMÁTICOS V9.9
 # ---------------------------------------------------------------------------
 
 BRANDFETCH_SEARCH_URL = "https://api.brandfetch.io/v2/search"
+
+# Dominios oficiales verificados para marcas frecuentes.
+# Esto NO reemplaza la búsqueda automática: sirve como atajo seguro cuando
+# conocemos inequívocamente la marca y evita falsos negativos del buscador.
+DOMINIOS_MARCAS_CONOCIDAS = {
+    "havanna": "havanna.com.ar",
+    "rapanui": "rapanui.com.ar",
+    "megatone": "megatone.net",
+    "freddo": "freddo.com.ar",
+    "farmacity": "farmacity.com",
+    "fravega": "fravega.com",
+    "musimundo": "musimundo.com",
+    "carrefour": "carrefour.com.ar",
+    "coto": "coto.com.ar",
+    "jumbo": "jumbo.com.ar",
+    "disco": "disco.com.ar",
+    "vea": "vea.com.ar",
+    "changomas": "changomas.com.ar",
+    "easy": "easy.com.ar",
+    "dexter": "dexter.com.ar",
+    "sportline": "sportline.com.ar",
+    "mostaza": "mostazaweb.com.ar",
+    "burger king": "burgerking.com.ar",
+    "mcdonalds": "mcdonalds.com.ar",
+    "mcdonald's": "mcdonalds.com.ar",
+    "ypf": "ypf.com",
+    "shell": "shell.com.ar",
+    "axion": "axionenergy.com",
+    "puma energy": "pumaenergy.com",
+}
 
 
 def normalizar_nombre_marca(texto: str) -> str:
@@ -941,6 +971,52 @@ def normalizar_nombre_marca(texto: str) -> str:
     texto = re.sub(r"\b(s\.?a\.?|s\.?r\.?l\.?|sa|srl|argentina|arg)\b", " ", texto)
     texto = re.sub(r"[^a-z0-9]+", " ", texto)
     return re.sub(r"\s+", " ", texto).strip()
+
+
+def dominio_conocido_para_comercio(comercio: str) -> str | None:
+    """
+    Devuelve un dominio sólo cuando la marca conocida aparece como palabra
+    completa o constituye el nombre principal del comercio.
+    """
+    buscado = normalizar_nombre_marca(comercio)
+    if not buscado:
+        return None
+
+    for marca, dominio in sorted(
+        DOMINIOS_MARCAS_CONOCIDAS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        marca_n = normalizar_nombre_marca(marca)
+        if buscado == marca_n:
+            return dominio
+
+        if re.search(
+            rf"(^| )" + re.escape(marca_n) + rf"( |$)",
+            buscado,
+        ):
+            return dominio
+
+    return None
+
+
+def construir_url_logo_brandfetch(dominio: str) -> str | None:
+    """
+    Genera una URL estable del CDN de Brandfetch a partir del dominio.
+    Pedimos un icono PNG de 128 px para que Compose lo pueda mostrar bien.
+    """
+    dominio = str(dominio or "").strip()
+    dominio = re.sub(r"^https?://", "", dominio, flags=re.I)
+    dominio = dominio.split("/")[0].strip().lower()
+
+    if not dominio or "." not in dominio or not BRANDFETCH_CLIENT_ID:
+        return None
+
+    return (
+        "https://cdn.brandfetch.io/"
+        f"{quote(dominio, safe='.')}/w/128/h/128/type/icon.png"
+        f"?c={quote(BRANDFETCH_CLIENT_ID, safe='')}"
+    )
 
 
 def puntuar_marca_brandfetch(comercio: str, candidato: dict) -> float:
@@ -967,14 +1043,12 @@ def puntuar_marca_brandfetch(comercio: str, candidato: dict) -> float:
     cobertura_buscado = len(comunes) / len(tokens_buscado)
     cobertura_nombre = len(comunes) / len(tokens_nombre)
 
-    # Ej.: "Havanna" vs "Havanna Argentina".
     if cobertura_buscado == 1.0 and cobertura_nombre >= 0.5:
         return 90.0
 
     if cobertura_nombre == 1.0 and cobertura_buscado >= 0.75:
         return 85.0
 
-    # Coincidencia fuerte, pero no perfecta.
     if cobertura_buscado >= 0.75 and cobertura_nombre >= 0.60:
         return 70.0
 
@@ -983,10 +1057,14 @@ def puntuar_marca_brandfetch(comercio: str, candidato: dict) -> float:
 
 def obtener_logo_brandfetch(comercio: str) -> str | None:
     """
-    Busca por nombre con Brand Search API y devuelve el icono del mejor
-    candidato sólo cuando la coincidencia es suficientemente segura.
-
-    Si no hay Client ID, no rompe el recolector: simplemente deja logo vacío.
+    V9.9:
+    1) Si conocemos de forma inequívoca el dominio oficial, usa directamente
+       Logo API de Brandfetch.
+    2) Si no, busca la marca por nombre con Brand Search API.
+    3) Acepta un candidato por coincidencia fuerte y construye la URL del
+       Logo API usando su dominio, aunque el campo 'icon' del buscador venga
+       vacío.
+    4) Si no hay coincidencia segura, devuelve None.
     """
     if not BRANDFETCH_CLIENT_ID:
         return None
@@ -1001,6 +1079,14 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
         "modo",
     }:
         return None
+
+    dominio_directo = dominio_conocido_para_comercio(comercio)
+    if dominio_directo:
+        logo = construir_url_logo_brandfetch(dominio_directo)
+        print(
+            f"   [LOGO] {comercio} -> dominio verificado {dominio_directo}"
+        )
+        return logo
 
     url = f"{BRANDFETCH_SEARCH_URL}/{quote(comercio, safe='')}"
 
@@ -1024,6 +1110,7 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
 
         candidatos = respuesta.json()
         if not isinstance(candidatos, list) or not candidatos:
+            print(f"   [LOGO] Sin resultados Brandfetch para {comercio!r}")
             return None
 
         evaluados = []
@@ -1031,8 +1118,8 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
             if not isinstance(candidato, dict):
                 continue
 
-            icono = str(candidato.get("icon", "") or "").strip()
-            if not icono.startswith("http"):
+            dominio = str(candidato.get("domain", "") or "").strip()
+            if not dominio:
                 continue
 
             puntaje = puntuar_marca_brandfetch(comercio, candidato)
@@ -1054,12 +1141,17 @@ def obtener_logo_brandfetch(comercio: str) -> str | None:
             )
             return None
 
-        icono = str(mejor.get("icon", "") or "").strip()
+        dominio = str(mejor.get("domain", "") or "").strip()
+        logo = construir_url_logo_brandfetch(dominio)
+
+        if not logo:
+            return None
+
         print(
             f"   [LOGO] {comercio} -> {mejor.get('name')} "
-            f"({mejor.get('domain') or '-'})"
+            f"({dominio})"
         )
-        return icono
+        return logo
 
     except Exception as exc:
         print(
@@ -2304,7 +2396,7 @@ def analizar_promo(
         ).upper()
 
     observaciones = (
-        "V9.8 API MODO | medios separados | fechas Argentina UTC-3 | logos Brandfetch | resistente"
+        "V9.9 API MODO | medios separados | fechas Argentina UTC-3 | logos Brandfetch mejorados | resistente"
     )
 
     if estado_api:
@@ -3092,7 +3184,7 @@ def main():
         )
 
     print(
-        "AhorraAcá - recolector MODO V9.8 + LOGOS BRANDFETCH"
+        "AhorraAcá - recolector MODO V9.9 + LOGOS BRANDFETCH MEJORADOS"
     )
     print(
         "Descubriendo promociones actuales..."
